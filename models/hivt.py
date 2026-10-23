@@ -24,12 +24,17 @@ from metrics import MR
 from models import GlobalInteractor
 from models import LocalEncoder
 from models import MLPDecoder
+from models import TransformerDecoder
+from models import Priors
 from utils import TemporalData
+from models import KinematicTransformerDecoder
+from models import FlowMatchingDecoder
 
 
 class HiVT(pl.LightningModule):
 
     def __init__(self,
+                 decoder_type: str,
                  historical_steps: int,
                  future_steps: int,
                  num_modes: int,
@@ -46,9 +51,11 @@ class HiVT(pl.LightningModule):
                  lr: float,
                  weight_decay: float,
                  T_max: int,
+                 return_embed: bool = False,
                  **kwargs) -> None:
         super(HiVT, self).__init__()
         self.save_hyperparameters()
+        self.decoder_type = decoder_type
         self.historical_steps = historical_steps
         self.future_steps = future_steps
         self.num_modes = num_modes
@@ -75,19 +82,26 @@ class HiVT(pl.LightningModule):
                                                   num_layers=num_global_layers,
                                                   dropout=dropout,
                                                   rotate=rotate)
-        self.decoder = MLPDecoder(local_channels=embed_dim,
-                                  global_channels=embed_dim,
-                                  future_steps=future_steps,
-                                  num_modes=num_modes,
-                                  uncertain=True)
+        if self.decoder_type == "MLP":
+            self.decoder = MLPDecoder(local_channels=embed_dim,global_channels=embed_dim,future_steps=future_steps,num_modes=num_modes,uncertain=True)
+        elif self.decoder_type == "Transformer":
+            self.decoder = TransformerDecoder(local_channels=embed_dim,global_channels=embed_dim,future_steps=future_steps,num_modes=num_modes,uncertain=True)
+            #self.decoder = KinematicTransformerDecoder(local_channels=embed_dim,global_channels = embed_dim,future_steps = future_steps,num_modes = num_modes,uncertain = True)
+        elif self.decoder_type == "Flow":
+            self.num_flow_steps = 10
+            self.decoder = FlowMatchingDecoder(local_channels=embed_dim, global_channels=embed_dim, future_steps=future_steps,
+                                  num_modes=num_modes, uncertain=True)
+        self.priors = Priors()
         self.reg_loss = LaplaceNLLLoss(reduction='mean')
         self.cls_loss = SoftTargetCrossEntropyLoss(reduction='mean')
-
+        self.return_embed = return_embed
         self.minADE = ADE()
         self.minFDE = FDE()
         self.minMR = MR()
 
-    def forward(self, data: TemporalData):
+    def encode(self, data: TemporalData):
+        """Rotation + encoders. Shared by training and inference. Call only ONCE per batch
+        (it rotates data.y in place)."""
         if self.rotate:
             rotate_mat = torch.empty(data.num_nodes, 2, 2, device=self.device)
             sin_vals = torch.sin(data['rotate_angles'])
@@ -104,12 +118,28 @@ class HiVT(pl.LightningModule):
 
         local_embed = self.local_encoder(data=data)
         global_embed = self.global_interactor(data=data, local_embed=local_embed)
-        y_hat, pi = self.decoder(local_embed=local_embed, global_embed=global_embed)
+        return local_embed, global_embed
+
+    def forward(self, data: TemporalData):
+        """Inference: start from noise and integrate the flow. Used by validation / test / eval.py."""
+        local_embed, global_embed = self.encode(data)
+        if self.decoder_type == "Flow":
+            y_hat, pi = self.decoder.sample(local_embed, global_embed, num_steps=self.num_flow_steps)
+        else:
+            y_hat, pi = self.decoder(local_embed, global_embed)
+        if self.return_embed:
+            return y_hat, pi, local_embed, global_embed
         return y_hat, pi
 
     def training_step(self, data, batch_idx):
-        y_hat, pi = self(data)
+        local_embed, global_embed = self.encode(data)
         reg_mask = ~data['padding_mask'][:, self.historical_steps:]
+        if self.decoder_type == "Flow":
+            x_t, t = self.decoder.add_noise(data.y, reg_mask)  # [F,N,H,2], [F,N]
+            y_hat, pi = self.decoder(local_embed, global_embed, x_t, t)
+        else:
+            y_hat, pi = self.decoder(local_embed, global_embed)
+
         valid_steps = reg_mask.sum(dim=-1)
         cls_mask = valid_steps > 0
         l2_norm = (torch.norm(y_hat[:, :, :, : 2] - data.y, p=2, dim=-1) * reg_mask).sum(dim=-1)  # [F, N]
@@ -119,17 +149,19 @@ class HiVT(pl.LightningModule):
         soft_target = F.softmax(-l2_norm[:, cls_mask] / valid_steps[cls_mask], dim=0).t().detach()
         cls_loss = self.cls_loss(pi[cls_mask], soft_target)
         loss = reg_loss + cls_loss
-        self.log('train_reg_loss', reg_loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=1)
+        self.log('train_reg_loss', reg_loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=data.num_graphs)
         return loss
 
     def validation_step(self, data, batch_idx):
         y_hat, pi = self(data)
+        #global_y_hat_agent, pi_agent, seq_id = self.visualization(data, batch_idx)
+
         reg_mask = ~data['padding_mask'][:, self.historical_steps:]
         l2_norm = (torch.norm(y_hat[:, :, :, : 2] - data.y, p=2, dim=-1) * reg_mask).sum(dim=-1)  # [F, N]
         best_mode = l2_norm.argmin(dim=0)
         y_hat_best = y_hat[best_mode, torch.arange(data.num_nodes)]
         reg_loss = self.reg_loss(y_hat_best[reg_mask], data.y[reg_mask])
-        self.log('val_reg_loss', reg_loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=1)
+        self.log('val_reg_loss', reg_loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=data.num_graphs)
 
         y_hat_agent = y_hat[:, data['agent_index'], :, : 2]
         y_agent = data.y[data['agent_index']]

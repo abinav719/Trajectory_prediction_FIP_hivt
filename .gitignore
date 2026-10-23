@@ -108,6 +108,12 @@ venv.bak/
 .idea
 .vscode
 
+#Project items
+/datasets/train
+/datasets/val
+/checkpoints
+
+
 # seed project
 lightning_logs/
 .DS_Store

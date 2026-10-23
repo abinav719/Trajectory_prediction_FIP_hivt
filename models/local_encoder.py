@@ -98,7 +98,6 @@ class LocalEncoder(nn.Module):
 
 
 class AAEncoder(MessagePassing):
-
     def __init__(self,
                  historical_steps: int,
                  node_dim: int,
