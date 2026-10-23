@@ -112,7 +112,8 @@ venv.bak/
 /datasets/train
 /datasets/val
 /checkpoints
-
+*.npz
+*.npy
 
 # seed project
 lightning_logs/
